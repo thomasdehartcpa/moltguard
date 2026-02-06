@@ -1,6 +1,6 @@
 {
-  "id": "og-openclawguard",
-  "name": "OG-OpenClawGuard",
+  "id": "openguardrails",
+  "name": "OpenGuardrails",
   "description": "Agent-based prompt injection detection for long content using LLM analysis",
   "version": "2.0.0",
   "configSchema": {

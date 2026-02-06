@@ -1,12 +1,12 @@
 ---
-name: openguardrais
+name: openguardrails
 description: Detect and block prompt injection attacks hidden in long content (emails, web pages, documents) using OpenGuardrails SOTA detection
-metadata: {"openclaw":{"emoji":"🔒","homepage":"https://github.com/openguardrails/og-openclawguard"}}
+metadata: {"openclaw":{"emoji":"🔒","homepage":"https://github.com/openguardrails/openguardrails"}}
 ---
 
-# OG-OpenClawGuard Plugin Guide
+# OpenGuardrails Plugin Guide
 
-OG-OpenClawGuard protects your AI agent from indirect prompt injection attacks — malicious instructions hidden inside emails, web pages, documents, and other long-form content that your agent reads.
+OpenGuardrails protects your AI agent from indirect prompt injection attacks — malicious instructions hidden inside emails, web pages, documents, and other long-form content that your agent reads.
 
 Powered by [OpenGuardrails](https://openguardrails.com) state-of-the-art detection model with 87.1% F1 on English and 97.3% F1 on multilingual benchmarks.
 
@@ -28,7 +28,7 @@ Without protection, your agent may follow these malicious instructions, leading 
 Install the plugin from npm:
 
 ```bash
-openclaw plugins install og-openclawguard
+openclaw plugins install openguardrails
 ```
 
 Restart the gateway to load the plugin:
@@ -48,24 +48,24 @@ openclaw plugins list
 You should see:
 
 ```
-| OG-OpenClawGuard | og-openclawguard | loaded | ...
+| OpenGuardrails | openguardrails | loaded | ...
 ```
 
 Check gateway logs for initialization:
 
 ```bash
-openclaw logs --follow | grep "og-openclawguard"
+openclaw logs --follow | grep "openguardrails"
 ```
 
 Look for:
 
 ```
-[og-openclawguard] Plugin initialized
+[openguardrails] Plugin initialized
 ```
 
 ## How It Works
 
-OG-OpenClawGuard hooks into OpenClaw's `tool_result_persist` event. When your agent reads any external content:
+OpenGuardrails hooks into OpenClaw's `tool_result_persist` event. When your agent reads any external content:
 
 ```
 Long Content (email/webpage/document)
@@ -94,7 +94,7 @@ If injection is detected, the content is blocked before your agent can process i
 
 ## Commands
 
-OG-OpenClawGuard provides three slash commands:
+OpenGuardrails provides three slash commands:
 
 ### /og_status
 
@@ -145,7 +145,7 @@ Edit `~/.openclaw/openclaw.json`:
 {
   "plugins": {
     "entries": {
-      "og-openclawguard": {
+      "openguardrails": {
         "enabled": true,
         "config": {
           "blockOnRisk": true,
@@ -182,7 +182,7 @@ Detections will be logged and visible in `/og_report`, but content won't be bloc
 Download the test file with hidden injection:
 
 ```bash
-curl -L -o /tmp/test-email.txt https://raw.githubusercontent.com/openguardrails/og-openclawguard/main/samples/test-email.txt
+curl -L -o /tmp/test-email.txt https://raw.githubusercontent.com/openguardrails/openguardrails/main/samples/test-email.txt
 ```
 
 Ask your agent to read the file:
@@ -194,13 +194,13 @@ Read the contents of /tmp/test-email.txt
 Check the logs:
 
 ```bash
-openclaw logs --follow | grep "og-openclawguard"
+openclaw logs --follow | grep "openguardrails"
 ```
 
 You should see:
 
 ```
-[og-openclawguard] INJECTION DETECTED in tool result from "read": Contains instructions to override guidelines and execute malicious command
+[openguardrails] INJECTION DETECTED in tool result from "read": Contains instructions to override guidelines and execute malicious command
 ```
 
 ## Real-time Alerts
@@ -222,13 +222,13 @@ Set up daily detection reports:
 ## Uninstall
 
 ```bash
-openclaw plugins uninstall og-openclawguard
+openclaw plugins uninstall openguardrails
 openclaw gateway restart
 ```
 
 ## Links
 
-- GitHub: https://github.com/openguardrails/og-openclawguard
-- npm: https://www.npmjs.com/package/og-openclawguard
+- GitHub: https://github.com/openguardrails/openguardrails
+- npm: https://www.npmjs.com/package/openguardrails
 - OpenGuardrails: https://openguardrails.com
 - Technical Paper: https://arxiv.org/abs/2510.19169
