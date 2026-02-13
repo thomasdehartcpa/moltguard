@@ -1,12 +1,12 @@
 ---
 name: moltguard
-description: Detect and block prompt injection attacks hidden in long content (emails, web pages, documents) using the MoltGuard API
-metadata: {"openclaw":{"emoji":"🔒","homepage":"https://github.com/openguardrails/moltguard"}}
+description: "OpenClaw security guardrail: locally sanitizes tool outputs and blocks indirect prompt injection (calls api.moltguard.com with sanitized text only)"
+metadata: {"openclaw":{"emoji":"🛡️","homepage":"https://github.com/openguardrails/moltguard"}}
 ---
 
 # MoltGuard Plugin Guide
 
-MoltGuard protects your AI agent from indirect prompt injection attacks — malicious instructions hidden inside emails, web pages, documents, and other long-form content that your agent reads.
+MoltGuard protects your OpenClaw from prompt injection attacks — malicious instructions hidden inside emails, web pages, documents, and other long-form content that your agent reads.
 
 ## Privacy & Network Transparency
 
@@ -35,12 +35,12 @@ That is the complete request body. **Not sent:** sessionKey, agentId, toolCallId
   "agentName": "openclaw-agent"
 }
 ```
-That is the complete request body — a hardcoded string. **Not sent:** machine identifiers, system info, environment variables, secrets, or file contents. You can verify this in `agent/config.ts` lines 46–64. To skip auto-registration entirely, set your API key manually in config.
+That is the complete request body — a hardcoded string. **Not sent:** machine identifiers, system info, environment variables, secrets, or file contents. You can verify this in `agent/config.ts` lines 46–64. To skip auto-registration entirely, set `autoRegister: false` and provide your own `apiKey` in config (see [API Key Management](#api-key-management) below).
 
 ### Local Storage
 
-- **API key:** `~/.openclaw/moltguard-credentials.json` — contains only `{ "apiKey": "..." }`. Created by `agent/config.ts`.
-- **Audit log:** `~/.openclaw/openclawguard.db` — local SQLite database with analysis verdicts. Never sent to any server. Created by `memory/store.ts`.
+- **API key:** `~/.openclaw/credentials/moltguard/credentials.json` — contains only `{ "apiKey": "..." }`. Created by `agent/config.ts`.
+- **Audit logs:** `~/.openclaw/logs/moltguard-analyses.jsonl` and `~/.openclaw/logs/moltguard-feedback.jsonl` — append-only JSONL files with analysis verdicts and user feedback. Never sent to any server. Created by `memory/store.ts`.
 - **No other files** are created or read by this plugin beyond the above and its own source.
 
 ### Additional Guarantees
@@ -77,7 +77,56 @@ Restart the gateway to load the plugin:
 openclaw gateway restart
 ```
 
-On first use, the plugin automatically registers an API key with MoltGuard — no email, password, or manual setup required.
+## API Key Management
+
+On first use, MoltGuard **automatically registers** a free API key — no email, password, or manual setup required.
+
+**Where is the key stored?**
+
+```
+~/.openclaw/credentials/moltguard/credentials.json
+```
+
+Contains only `{ "apiKey": "mga_..." }`.
+
+**Use your own key instead:**
+
+Set `apiKey` in your plugin config (`~/.openclaw/openclaw.json`):
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "moltguard": {
+        "config": {
+          "apiKey": "mga_your_key_here"
+        }
+      }
+    }
+  }
+}
+```
+
+**Disable auto-registration entirely:**
+
+If you are in a managed or no-network environment and want to prevent the one-time registration call:
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "moltguard": {
+        "config": {
+          "apiKey": "mga_your_key_here",
+          "autoRegister": false
+        }
+      }
+    }
+  }
+}
+```
+
+With `autoRegister: false` and no `apiKey`, analyses will fail until a key is provided.
 
 ## Verify Installation
 
@@ -192,7 +241,11 @@ Edit `~/.openclaw/openclaw.json`:
         "enabled": true,
         "config": {
           "blockOnRisk": true,
-          "timeoutMs": 60000
+          "timeoutMs": 60000,
+          "apiKey": "",
+          "autoRegister": true,
+          "apiBaseUrl": "https://api.moltguard.com",
+          "logPath": "~/.openclaw/logs"
         }
       }
     }
@@ -202,10 +255,13 @@ Edit `~/.openclaw/openclaw.json`:
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| enabled | true | Enable/disable the plugin |
-| blockOnRisk | true | Block content when injection is detected |
-| apiKey | (auto) | MoltGuard API key (auto-registered if missing) |
-| timeoutMs | 60000 | Analysis timeout (ms) |
+| enabled | `true` | Enable/disable the plugin |
+| blockOnRisk | `true` | Block content when injection is detected |
+| apiKey | `""` (auto) | MoltGuard API key. Leave blank to auto-register on first use |
+| autoRegister | `true` | Automatically register a free API key if `apiKey` is empty |
+| timeoutMs | `60000` | Analysis timeout in milliseconds |
+| apiBaseUrl | `https://api.moltguard.com` | MoltGuard API endpoint (override for staging or self-hosted) |
+| logPath | `~/.openclaw/logs` | Directory for JSONL audit log files |
 
 ### Log-only Mode
 
@@ -222,7 +278,7 @@ Detections will be logged and visible in `/og_report`, but content won't be bloc
 Download the test file with hidden injection:
 
 ```bash
-curl -L -o /tmp/test-email.txt https://raw.githubusercontent.com/moltguard/moltguard/main/samples/test-email.txt
+curl -L -o /tmp/test-email.txt https://raw.githubusercontent.com/openguardrails/moltguard/main/samples/test-email.txt
 ```
 
 Ask your agent to read the file:
@@ -250,10 +306,14 @@ openclaw plugins uninstall @openguardrails/moltguard
 openclaw gateway restart
 ```
 
-To also remove your stored API key:
+To also remove stored data (optional):
 
 ```bash
-rm ~/.openclaw/moltguard-credentials.json
+# Remove API key
+rm -rf ~/.openclaw/credentials/moltguard
+
+# Remove audit logs
+rm -f ~/.openclaw/logs/moltguard-analyses.jsonl ~/.openclaw/logs/moltguard-feedback.jsonl
 ```
 
 ## Links
