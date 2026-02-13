@@ -48,16 +48,24 @@ export class GatewayManager {
       this.log.info(`Starting gateway on port ${this.port}...`);
 
       // Spawn gateway process
-      const gatewayPath = join(__dirname, "gateway", "index.ts");
+      // Use compiled JS if available, fallback to TS
+      const gatewayJsPath = join(__dirname, "dist", "gateway", "index.js");
+      const gatewayTsPath = join(__dirname, "gateway", "index.ts");
 
-      // Use Node.js with TypeScript loader
+      const fs = await import("node:fs");
+      const gatewayPath = fs.existsSync(gatewayJsPath) ? gatewayJsPath : gatewayTsPath;
+
+      // Try bun first (fast TypeScript support), fallback to node
+      const runtime = process.execPath.includes("bun") ? "bun" : "node";
+      const args = runtime === "bun"
+        ? [gatewayPath]
+        : gatewayPath.endsWith(".js")
+          ? [gatewayPath]
+          : ["--experimental-strip-types", "--no-warnings", gatewayPath];
+
       this.process = spawn(
-        "node",
-        [
-          "--loader",
-          "tsx",
-          gatewayPath,
-        ],
+        runtime,
+        args,
         {
           env: {
             ...process.env,

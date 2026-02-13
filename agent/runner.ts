@@ -60,9 +60,23 @@ async function ensureApiKey(
   }
 
   log.info("No API key found — registering with MoltGuard...");
-  const newKey = await registerApiKey("openclaw-agent", apiBaseUrl);
-  log.info("Registered with MoltGuard. API key saved to ~/.openclaw/credentials/moltguard/credentials.json");
-  return newKey;
+
+  try {
+    // Add 10-second timeout for registration to prevent hanging
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000);
+
+    const newKey = await registerApiKey("openclaw-agent", apiBaseUrl);
+    clearTimeout(timeoutId);
+
+    log.info("Registered with MoltGuard. API key saved to ~/.openclaw/credentials/moltguard/credentials.json");
+    return newKey;
+  } catch (error) {
+    throw new Error(
+      `Failed to auto-register API key: ${error instanceof Error ? error.message : String(error)}. ` +
+      "Please check your network connection or set apiKey manually in config."
+    );
+  }
 }
 
 // =============================================================================

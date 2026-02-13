@@ -97,6 +97,9 @@ function createLogger(baseLogger: Logger): Logger {
 // Plugin Definition
 // =============================================================================
 
+// Store gateway manager instance for cleanup (closure variable)
+let globalGatewayManager: GatewayManager | null = null;
+
 const openClawGuardPlugin = {
   id: PLUGIN_ID,
   name: PLUGIN_NAME,
@@ -108,20 +111,19 @@ const openClawGuardPlugin = {
     const config = resolveConfig(pluginConfig);
     const log = createLogger(api.logger);
 
-    // Check if plugin is enabled
-    if (!config.enabled) {
-      log.info("Plugin disabled via config");
+    // Check if at least one feature is enabled
+    if (!config.enabled && !config.sanitizePrompt) {
+      log.info("Plugin disabled via config (both injection detection and gateway disabled)");
       return;
     }
 
-    // Initialize analysis store
+    // Initialize analysis store (needed for both features)
     const logPath = api.resolvePath(config.logPath);
     const store = createAnalysisStore(logPath, log);
 
     // Initialize gateway if sanitizePrompt is enabled
-    let gatewayManager: GatewayManager | null = null;
     if (config.sanitizePrompt) {
-      gatewayManager = new GatewayManager(
+      globalGatewayManager = new GatewayManager(
         {
           port: config.gatewayPort || 8900,
           autoStart: config.gatewayAutoStart ?? true,
@@ -130,7 +132,7 @@ const openClawGuardPlugin = {
       );
 
       // Start gateway
-      gatewayManager.start().catch((error) => {
+      globalGatewayManager.start().catch((error) => {
         log.error(`Failed to start gateway: ${error}`);
       });
 
@@ -154,8 +156,12 @@ const openClawGuardPlugin = {
       }
     }
 
-    // Register tool_result_persist hook to analyze tool results
-    api.on("tool_result_persist", (event, ctx) => {
+    // Only register injection detection hooks if enabled
+    if (config.enabled) {
+      log.info("Injection detection enabled");
+
+      // Register tool_result_persist hook to analyze tool results
+      api.on("tool_result_persist", (event, ctx) => {
       const toolName = ctx.toolName ?? event.toolName ?? "unknown";
 
       log.info(`tool_result_persist triggered for "${toolName}"`);
@@ -215,11 +221,24 @@ const openClawGuardPlugin = {
     });
 
     // Register message_received hook (for analyzing long content)
-    api.on("message_received", async (event, ctx) => {
+    api.on("message_received", (event, ctx) => {
+      log.info(`message_received hook triggered, content length: ${event.content.length}`);
+
       if (event.content.length < 1000) {
+        log.info(`Skipping analysis: content too short (${event.content.length} < 1000 chars)`);
         return;
       }
 
+      // Skip analysis if no API key and auto-register is disabled
+      // (Don't block user messages while waiting for API key registration)
+      if (!resolvedApiKey && !config.autoRegister) {
+        log.info("Skipping message analysis: no API key and autoRegister disabled");
+        return;
+      }
+
+      log.info("Starting async analysis...");
+
+      // Run analysis asynchronously (don't block message processing)
       const startTime = Date.now();
 
       const target: AnalysisTarget = {
@@ -231,18 +250,17 @@ const openClawGuardPlugin = {
         },
       };
 
-      try {
-        const verdict = await runGuardAgent(
-          target,
-          {
-            apiKey: resolvedApiKey,
-            timeoutMs: config.timeoutMs,
-            autoRegister: config.autoRegister,
-            apiBaseUrl: config.apiBaseUrl,
-          },
-          log,
-        );
-
+      // Fire-and-forget: don't await (don't block the hook)
+      runGuardAgent(
+        target,
+        {
+          apiKey: resolvedApiKey,
+          timeoutMs: config.timeoutMs,
+          autoRegister: config.autoRegister,
+          apiBaseUrl: config.apiBaseUrl,
+        },
+        log,
+      ).then((verdict) => {
         const durationMs = Date.now() - startTime;
 
         store.logAnalysis({
@@ -259,12 +277,12 @@ const openClawGuardPlugin = {
             `Suspicious content in message (${event.content.length} chars): ${verdict.reason}`,
           );
         }
-
-        return undefined;
-      } catch (error) {
+      }).catch((error) => {
         log.error(`Message analysis failed: ${error}`);
-        return undefined;
-      }
+      });
+
+      // Return immediately (don't block message processing)
+      return undefined;
     });
 
     // Register status command
@@ -399,14 +417,21 @@ const openClawGuardPlugin = {
       },
     });
 
+      log.info(
+        `Injection detection initialized (block: ${config.blockOnRisk}, timeout: ${config.timeoutMs}ms)`,
+      );
+    } else {
+      log.info("Injection detection disabled via config");
+    }
+
     // Register gateway management commands (if gateway is enabled)
-    if (gatewayManager) {
+    if (globalGatewayManager) {
       api.registerCommand({
         name: "mg_status",
         description: "Show MoltGuard gateway status",
         requireAuth: true,
         handler: async () => {
-          const status = gatewayManager!.getStatus();
+          const status = globalGatewayManager!.getStatus();
           const lines = [
             "**MoltGuard Gateway Status**",
             "",
@@ -441,7 +466,7 @@ const openClawGuardPlugin = {
         requireAuth: true,
         handler: async () => {
           try {
-            await gatewayManager!.start();
+            await globalGatewayManager!.start();
             return { text: "Gateway started successfully" };
           } catch (error) {
             return {
@@ -457,7 +482,7 @@ const openClawGuardPlugin = {
         requireAuth: true,
         handler: async () => {
           try {
-            await gatewayManager!.stop();
+            await globalGatewayManager!.stop();
             return { text: "Gateway stopped" };
           } catch (error) {
             return {
@@ -473,7 +498,7 @@ const openClawGuardPlugin = {
         requireAuth: true,
         handler: async () => {
           try {
-            await gatewayManager!.restart();
+            await globalGatewayManager!.restart();
             return { text: "Gateway restarted successfully" };
           } catch (error) {
             return {
@@ -483,10 +508,17 @@ const openClawGuardPlugin = {
         },
       });
     }
+  },
 
-    log.info(
-      `Initialized (block: ${config.blockOnRisk}, timeout: ${config.timeoutMs}ms)`,
-    );
+  // Cleanup: stop gateway when plugin unloads
+  async unregister() {
+    if (globalGatewayManager) {
+      try {
+        await globalGatewayManager.stop();
+      } catch (error) {
+        console.error("[moltguard] Failed to stop gateway during cleanup:", error);
+      }
+    }
   },
 };
 

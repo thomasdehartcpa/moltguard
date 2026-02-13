@@ -106,14 +106,11 @@ export function validateConfig(config: GatewayConfig): void {
     throw new Error(`Invalid port: ${config.port}`);
   }
 
-  const backendCount = Object.keys(config.backends).length;
-  if (backendCount === 0) {
-    throw new Error(
-      "No backends configured. Set environment variables (ANTHROPIC_API_KEY, OPENAI_API_KEY, etc.) or create config file at ~/.moltguard/gateway.json",
-    );
-  }
+  // Note: Backends are now optional. Gateway will act as transparent proxy.
+  // If no backends configured, gateway will forward requests based on routing rules
+  // or pass through to the original target.
 
-  // Validate each backend
+  // Validate each backend (if any)
   for (const [name, backend] of Object.entries(config.backends)) {
     if (!backend.baseUrl) {
       throw new Error(`Backend ${name} missing baseUrl`);

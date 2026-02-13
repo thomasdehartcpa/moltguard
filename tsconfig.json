@@ -15,6 +15,12 @@
     "sourceMap": true,
     "resolveJsonModule": true
   },
-  "include": ["./**/*.ts"],
-  "exclude": ["node_modules", "dist"]
+  "include": [
+    "./index.ts",
+    "./gateway-manager.ts",
+    "./agent/**/*.ts",
+    "./gateway/**/*.ts",
+    "./memory/**/*.ts"
+  ],
+  "exclude": ["node_modules", "dist", "openclaw"]
 }
