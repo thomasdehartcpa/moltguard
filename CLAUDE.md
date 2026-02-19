@@ -148,6 +148,27 @@ npm test            # vitest run
 npm run test:watch  # vitest watch mode
 ```
 
+## Maintenance
+
+**This file must be kept current.** When making substantive changes to this codebase, update the relevant sections of this CLAUDE.md before or as part of the same commit. Drift between the code and this document undermines its purpose.
+
+Update this file when:
+- The data flow through the sanitization pipeline changes
+- New PII detection categories are added or removed from `gateway/sanitizer.ts`
+- The token vault's persistence mechanism, TTL, or session model changes
+- New gateway handlers are added (`gateway/handlers/`)
+- Plugin config options change (`agent/config.ts`)
+- The gateway proxy architecture changes (`gateway/index.ts`, `gateway-manager.ts`)
+- New OpenClaw commands are registered
+- Section 7216 compliance posture changes
+
+Do **not** update this file for:
+- Minor bug fixes that don't change architecture or behaviour
+- Test-only changes
+- Formatting or comment updates
+
+---
+
 ## Section 7216 Compliance Notes
 
 - The token vault file (`~/.moltguard/token-vault.json`) must remain on local filesystem only
