@@ -24,7 +24,16 @@ export function loadConfig(configPath?: string): GatewayConfig {
   // Try to load from file
   if (existsSync(path)) {
     try {
-      const fileContent = readFileSync(path, "utf-8");
+      let fileContent = readFileSync(path, "utf-8");
+      // Interpolate ${ENV_VAR} references with environment variable values
+      fileContent = fileContent.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (_match, varName) => {
+        const value = process.env[varName];
+        if (value === undefined) {
+          console.warn(`[moltguard-gateway] Environment variable ${varName} referenced in config but not set`);
+          return "";
+        }
+        return value;
+      });
       const fileConfig = JSON.parse(fileContent);
       return mergeConfig(defaultConfig, fileConfig);
     } catch (error) {

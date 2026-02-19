@@ -13,8 +13,11 @@ import type { GatewayConfig } from "./types.js";
 import { handleAnthropicRequest } from "./handlers/anthropic.js";
 import { handleOpenAIRequest } from "./handlers/openai.js";
 import { handleGeminiRequest } from "./handlers/gemini.js";
+import { TokenVault } from "./token-vault.js";
 
 let config: GatewayConfig;
+let vault: TokenVault;
+let gatewaySessionId: string;
 
 /**
  * Main request handler
@@ -28,18 +31,6 @@ async function handleRequest(
   // Log request
   console.log(`[moltguard-gateway] ${method} ${url}`);
 
-  // CORS headers (for browser-based clients)
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, x-api-key, anthropic-version");
-
-  // Handle OPTIONS for CORS preflight
-  if (method === "OPTIONS") {
-    res.writeHead(204);
-    res.end();
-    return;
-  }
-
   // Only allow POST
   if (method !== "POST") {
     res.writeHead(405, { "Content-Type": "application/json" });
@@ -51,16 +42,16 @@ async function handleRequest(
   try {
     if (url === "/v1/messages") {
       // Anthropic Messages API
-      await handleAnthropicRequest(req, res, config);
-    } else if (url === "/v1/chat/completions") {
+      await handleAnthropicRequest(req, res, config, vault, gatewaySessionId);
+    } else if (url === "/v1/chat/completions" || url === "/chat/completions") {
       // OpenAI Chat Completions API
-      await handleOpenAIRequest(req, res, config);
+      await handleOpenAIRequest(req, res, config, vault, gatewaySessionId);
     } else if (url?.match(/^\/v1\/models\/(.+):generateContent$/)) {
       // Gemini API
       const match = url.match(/^\/v1\/models\/(.+):generateContent$/);
       const modelName = match?.[1];
       if (modelName) {
-        await handleGeminiRequest(req, res, config, modelName);
+        await handleGeminiRequest(req, res, config, modelName, vault, gatewaySessionId);
       } else {
         res.writeHead(404, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: "Model name required" }));
@@ -95,6 +86,14 @@ export function startGateway(configPath?: string): void {
     config = loadConfig(configPath);
     validateConfig(config);
 
+    // Initialize token vault for persistent session-scoped tokenization
+    vault = new TokenVault();
+    // Create a shared session for the gateway's lifetime.  This ensures
+    // consistent placeholder mappings across all API calls in a conversation,
+    // even when clients don't send an x-moltguard-session header.
+    gatewaySessionId = vault.createSession();
+    console.log(`[moltguard-gateway] Token vault initialized (session ${gatewaySessionId})`);
+
     console.log("[moltguard-gateway] Configuration loaded:");
     console.log(`  Port: ${config.port}`);
     console.log(
@@ -121,6 +120,8 @@ export function startGateway(configPath?: string): void {
     // Handle shutdown
     process.on("SIGINT", () => {
       console.log("\n[moltguard-gateway] Shutting down...");
+      vault.destroySession(gatewaySessionId);
+      vault.close();
       server.close(() => {
         console.log("[moltguard-gateway] Server stopped");
         process.exit(0);
@@ -129,6 +130,8 @@ export function startGateway(configPath?: string): void {
 
     process.on("SIGTERM", () => {
       console.log("\n[moltguard-gateway] Shutting down...");
+      vault.destroySession(gatewaySessionId);
+      vault.close();
       server.close(() => {
         console.log("[moltguard-gateway] Server stopped");
         process.exit(0);

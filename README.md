@@ -3,9 +3,7 @@
 [![npm version](https://img.shields.io/npm/v/@openguardrails/moltguard.svg)](https://www.npmjs.com/package/@openguardrails/moltguard)
 [![GitHub](https://img.shields.io/github/license/openguardrails/moltguard)](https://github.com/openguardrails/moltguard)
 
-**Comprehensive AI security for OpenClaw**: Local prompt sanitization + Prompt injection detection.
-
-Powered by the [MoltGuard](https://moltguard.com) detection API.
+**Local PII sanitization gateway for OpenClaw.** Strips sensitive data from prompts before they reach LLM APIs and restores original values in responses. All processing happens on your machine — no data is sent to any MoltGuard endpoint.
 
 **GitHub**: [https://github.com/openguardrails/moltguard](https://github.com/openguardrails/moltguard)
 
@@ -13,16 +11,17 @@ Powered by the [MoltGuard](https://moltguard.com) detection API.
 
 ## Features
 
-✨ **NEW: Local Prompt Sanitization Gateway** - Protect sensitive data (bank cards, passwords, API keys) before sending to LLMs
-🛡️ **Prompt Injection Detection** - Detect and block malicious instructions hidden in external content
-🔒 **Privacy-First** - All sensitive data processing happens locally on your machine
-🚀 **Zero-Config** - Works out of the box with automatic API key registration
+- **Local Prompt Sanitization Gateway** - Protect sensitive data (SSNs, bank cards, passwords, API keys, names, addresses) before sending to LLMs
+- **Tool-Call PII Sanitization** - Automatically sanitize outbound tool calls (curl, web search, etc.) and restore in results
+- **IRC Section 7216 Compliance** - Taxpayer PII (SSN, ITIN, EIN, tax years, financial amounts, names, addresses) is redacted before reaching cloud APIs
+- **Privacy-First** - All processing happens locally on `127.0.0.1`. No cloud endpoints, no telemetry, no API keys
 
 ## Table of Contents
 
 - [Quick Start](#quick-start)
-- [Feature 1: Local Prompt Sanitization Gateway](#feature-1-local-prompt-sanitization-gateway)
-- [Feature 2: Prompt Injection Detection](#feature-2-prompt-injection-detection)
+- [How It Works](#how-it-works)
+- [Supported Data Types](#supported-data-types)
+- [Gateway Setup](#gateway-setup)
 - [Installation](#installation)
 - [Configuration](#configuration)
 - [Commands](#commands)
@@ -36,15 +35,17 @@ openclaw plugins install @openguardrails/moltguard
 
 # Restart OpenClaw
 openclaw gateway restart
+```
 
-# Enable prompt sanitization (optional, protects sensitive data)
-# Edit ~/.openclaw/openclaw.json and add:
+Enable in `~/.openclaw/openclaw.json`:
+
+```json
 {
   "plugins": {
     "entries": {
       "moltguard": {
         "config": {
-          "sanitizePrompt": true  // ← Enable local sanitization gateway
+          "sanitizePrompt": true
         }
       }
     }
@@ -52,46 +53,66 @@ openclaw gateway restart
 }
 ```
 
-## Feature 1: Local Prompt Sanitization Gateway
-
-**NEW in v6.0** - Protect sensitive data in your prompts before sending to LLMs.
-
-### What It Does
+## How It Works
 
 The Gateway is a **local HTTP proxy** that automatically:
 
 1. **Intercepts** your prompts before they reach the LLM
-2. **Sanitizes** sensitive data (bank cards, passwords, API keys, etc.)
-3. **Sends** sanitized prompts to the LLM (Claude/GPT/Kimi/etc.)
-4. **Restores** original values in responses before tool execution
+2. **Sanitizes** sensitive data (SSNs, names, addresses, bank cards, API keys, etc.)
+3. **Sends** sanitized prompts to the LLM (Claude/GPT/DeepSeek/Gemini/etc.)
+4. **Restores** original values in responses before they reach the client — streaming responses are automatically buffered for correct restoration
 
 **Example:**
 
 ```
-You: "My card is 6222021234567890, book a hotel"
-  ↓ Gateway sanitizes
-LLM sees: "My card is __bank_card_1__, book a hotel"
-  ↓ LLM responds
-LLM: "Booking with __bank_card_1__"
-  ↓ Gateway restores
-Tool executes with: "Booking with 6222021234567890"
+You: "My SSN is 123-45-6789, file my return"
+  | Gateway sanitizes
+LLM sees: "My SSN is [ssn_1], file my return"
+  | LLM responds
+LLM: "Filing return for [ssn_1]"
+  | Gateway restores
+Tool executes with: "Filing return for 123-45-6789"
 ```
 
-### Supported Data Types
+The restorer handles both the canonical bracketed form (`[ssn_1]`) and the bracket-stripped form (`ssn_1`) that some LLMs produce when they interpret square brackets as formatting and drop them. Word-boundary matching prevents partial-token collisions.
 
-| Data Type | Placeholder Example | Detected Patterns |
-|-----------|-------------------|-------------------|
-| Bank Cards | `__bank_card_1__` | 16-19 digit numbers |
-| Credit Cards | `__credit_card_1__` | 1234-5678-9012-3456 |
-| Email | `__email_1__` | user@example.com |
-| Phone | `__phone_1__` | +86-138-1234-5678 |
-| API Keys | `__secret_1__` | sk-..., ghp_..., Bearer tokens |
-| IP Address | `__ip_1__` | 192.168.1.1 |
-| SSN | `__ssn_1__` | 123-45-6789 |
-| IBAN | `__iban_1__` | GB82WEST12345698765432 |
-| URL | `__url_1__` | https://example.com |
+For streaming responses (SSE), the gateway automatically switches the backend request to non-streaming when PII restoration is needed. This prevents placeholders from being fragmented across SSE delta chunks (e.g., `[person_1]` split into `[pers` + `on_1]`). The restored response is re-encoded as SSE events — including tool calls and all message fields — so the client's streaming parser and tool execution pipeline work transparently. Streaming-only request fields like `stream_options` are removed automatically to maintain compatibility with APIs that validate them (e.g., DeepSeek).
 
-### Gateway Setup
+**Anti-hallucination defense:** LLMs can learn the `[category_N]` pattern and fabricate new placeholders for values the sanitizer didn't catch (e.g., `[person_159]` when the sanitizer only created up to `[person_158]`). MoltGuard defends against this in three ways: (1) a system-level instruction is injected telling the LLM to never invent new placeholders, (2) expanded name detection catches names in email headers (`From: Name <email>`), salutations (`Hi Karen,`), and angle-bracketed email contexts to reduce the number of unsanitized names the LLM sees, and (3) a post-restoration pass detects any remaining fabricated placeholder-shaped tokens that have no mapping table entry and leaves them visible rather than stripping them to empty strings.
+
+**False-positive prevention:** The sanitizer uses multi-layer filtering to prevent non-PII text from being classified as person names. Markdown structural lines (headings, bold text, list items, emphasis) are automatically excluded. A set of 120+ common technical/structural terms (e.g., "Critical", "Schedule", "Gateway", "Configuration") supplements the existing tax/financial exclusion list. Title-case phrases with 3+ words require at least one known first name to match (preventing matches like "Screen Time Safeguard"), and ALL_CAPS matches are limited to 2-3 words (matching real tax form names like "JOHN SMITH" but not section headers like "CRITICAL CONSTRAINTS"). Dates inside file paths (preceded by `/` or followed by `.`) are excluded to prevent tool calls from breaking (e.g., `memory/2026-02-17.md` is not sanitized).
+
+**LLM self-censoring conflict:** If the LLM has its own instructions to protect client data (e.g., system prompt rules about confidentiality, AICPA compliance, or Section 7216), it may attempt to redact sensitive values *on its own* — replacing client names or email subjects with arbitrary text from its context window (tool descriptions, section headers, etc.). MoltGuard cannot undo these ad-hoc substitutions because they don't follow the `[category_N]` placeholder format. **The fix is in the Agent's instructions, not in MoltGuard:** tell the LLM that MoltGuard handles sanitization at the gateway layer and it should use all data exactly as it appears in the conversation. The LLM's role should be to *alert* on suspected unsanitized PII, not to redact it. See the OpenClaw workspace `STRATEGY.md` for an example of how to configure this.
+
+Additionally, tool calls to external services (curl, web search, etc.) are sanitized via OpenClaw plugin hooks, independent of the gateway proxy.
+
+**Auth argument shielding:** Some external CLI tools (e.g., `gog`) use flags like `--account` and `--client` to look up local OAuth credentials. These values are not outbound PII — they never leave the machine — but the sanitizer would otherwise redact them (e.g., replacing `--account user@example.com` with `--account [email_1]`), breaking authentication. MoltGuard shields these auth-related flag values before sanitization and restores them afterward, so credential lookups work while all other PII in the command is still redacted.
+
+## Supported Data Types
+
+| Data Type | Placeholder Example | Detection Method |
+|-----------|-------------------|-----------------|
+| SSN | `[ssn_1]` | 123-45-6789, 123 45 6789, 123456789 |
+| ITIN | `[itin_1]` | 9XX-XX-XXXX (starts with 9) |
+| EIN | `[ein_1]` | XX-XXXXXXX |
+| Person Names | `[person_1]` | NLP + title-case/all-caps/email-header/salutation heuristics (Mc/Mac/De/Le-prefixed surnames; structural-line and heading exclusion; 120+ technical term exclusions; 3+ word title-case requires known first name anchor) |
+| Addresses | `[address_1]` | Street + city/state/zip patterns |
+| Currency | `[currency_1]` | $-prefixed amounts + context-aware bare amounts |
+| Tax Year | `[tax_year_1]` | Years near tax keywords (context-aware) |
+| Standalone Date | `[date_1]` | MM/DD/YYYY and YYYY-MM-DD formats (file-path-aware: skips dates in paths like `memory/2026-02-17.md`) |
+| Date of Birth | `[dob_1]` | Dates near DOB keywords (context-aware) |
+| Bank Account | `[bank_account_1]` | 8-17 digit numbers near banking keywords |
+| Routing Number | `[routing_number_1]` | 9-digit ABA-validated numbers |
+| Credit Cards | `[credit_card_1]` | 4x4 digit patterns |
+| Bank Cards | `[bank_card_1]` | 16-19 digit numbers |
+| Email | `[email_1]` | user@example.com |
+| Phone | `[phone_1]` | US/international formats |
+| API Keys | `[secret_1]` | sk-..., ghp_..., Bearer tokens, high-entropy strings |
+| IP Address | `[ip_1]` | 192.168.1.1 |
+| IBAN | `[iban_1]` | International bank account numbers |
+| URL | `[url_1]` | https://example.com |
+
+## Gateway Setup
 
 **1. Enable in config** (`~/.openclaw/openclaw.json`):
 
@@ -101,9 +122,9 @@ Tool executes with: "Booking with 6222021234567890"
     "entries": {
       "moltguard": {
         "config": {
-          "sanitizePrompt": true,      // Enable gateway
-          "gatewayPort": 8900,         // Gateway port (default: 8900)
-          "gatewayAutoStart": true     // Auto-start (default: true)
+          "sanitizePrompt": true,
+          "gatewayPort": 8900,
+          "gatewayAutoStart": true
         }
       }
     }
@@ -118,8 +139,8 @@ Tool executes with: "Booking with 6222021234567890"
   "models": {
     "providers": {
       "claude-protected": {
-        "baseUrl": "http://127.0.0.1:8900",  // ← Point to gateway
-        "api": "anthropic-messages",          // Keep protocol unchanged
+        "baseUrl": "http://127.0.0.1:8900",
+        "api": "anthropic-messages",
         "apiKey": "${ANTHROPIC_API_KEY}",
         "models": [...]
       }
@@ -134,63 +155,6 @@ Tool executes with: "Booking with 6222021234567890"
 openclaw gateway restart
 ```
 
-### Gateway Commands
-
-| Command | Description |
-|---------|-------------|
-| `/mg_status` | View gateway status and config examples |
-| `/mg_start` | Start the gateway |
-| `/mg_stop` | Stop the gateway |
-| `/mg_restart` | Restart the gateway |
-
-📖 **Full Guide**: See [GATEWAY_GUIDE.md](./GATEWAY_GUIDE.md) for detailed setup instructions, protocol support, and troubleshooting.
-
-## Feature 2: Prompt Injection Detection
-
-Detect and block malicious instructions hidden in external content (emails, web pages, documents).
-
-### How It Works
-
-Before injection detection analysis, content is **sanitized locally** to remove PII:
-
-| Data Type | Placeholder |
-|-----------|-------------|
-| Email addresses | `<EMAIL>` |
-| Phone numbers | `<PHONE>` |
-| Credit card numbers | `<CREDIT_CARD>` |
-| SSNs | `<SSN>` |
-| IP addresses | `<IP_ADDRESS>` |
-| API keys & secrets | `<SECRET>` |
-| URLs | `<URL>` |
-| IBANs | `<IBAN>` |
-
-Then the sanitized content is sent to MoltGuard API for analysis:
-
-### Detection Flow
-
-```
-External Content (email/webpage/document)
-         ↓
-   ┌─────────────┐
-   │   Local     │  Strip PII: emails, phones, cards,
-   │  Sanitize   │  SSNs, API keys, URLs, IBANs...
-   └─────────────┘
-         ↓
-   ┌─────────────┐
-   │  MoltGuard  │  POST /api/check/tool-call
-   │     API     │  { sanitized content }
-   └─────────────┘
-         ↓
-   ┌─────────────┐
-   │   Verdict   │  { isInjection, confidence,
-   │             │    reason, findings }
-   └─────────────┘
-         ↓
-   Block or Allow
-```
-
-The plugin hooks into OpenClaw's `tool_result_persist` and `message_received` events. When your agent reads external content, MoltGuard sanitizes it locally, sends to API for analysis, and blocks if injection is detected.
-
 ## Installation
 
 ```bash
@@ -200,8 +164,6 @@ openclaw plugins install @openguardrails/moltguard
 # Restart gateway to load the plugin
 openclaw gateway restart
 ```
-
-On first use, the plugin automatically registers an API key with MoltGuard — no email, password, or manual setup required.
 
 ## Verify Installation
 
@@ -215,83 +177,6 @@ You should see:
 | MoltGuard | moltguard | loaded | ...
 ```
 
-## Commands
-
-### Gateway Management
-
-| Command | Description |
-|---------|-------------|
-| `/mg_status` | View gateway status and configuration |
-| `/mg_start` | Start the sanitization gateway |
-| `/mg_stop` | Stop the sanitization gateway |
-| `/mg_restart` | Restart the sanitization gateway |
-
-### Injection Detection
-
-| Command | Description |
-|---------|-------------|
-| `/og_status` | View detection status and statistics |
-| `/og_report` | View recent injection detections |
-| `/og_feedback <id> fp [reason]` | Report false positive |
-| `/og_feedback missed <reason>` | Report missed detection |
-
-## Testing Detection
-
-### 1. Download Test File
-
-Download the test file with hidden injection:
-
-```bash
-curl -L -o /tmp/test-email.txt https://raw.githubusercontent.com/openguardrails/moltguard/main/samples/test-email.txt
-```
-
-### 2. Test in OpenClaw
-
-Ask the agent to read this file:
-
-```
-Read the contents of /tmp/test-email.txt
-```
-
-### 3. View Detection Logs
-
-```bash
-openclaw logs --follow | grep "moltguard"
-```
-
-If detection succeeds, you'll see:
-
-```
-[moltguard] tool_result_persist triggered for "read"
-[moltguard] Analyzing tool result from "read" (1183 chars)
-[moltguard] Analysis complete in 312ms: INJECTION DETECTED
-[moltguard] INJECTION DETECTED in tool result from "read": Contains instructions to override guidelines and execute a malicious shell command
-```
-
-### 4. View Statistics
-
-In OpenClaw conversation:
-
-```
-/og_status
-```
-
-### 5. View Detection Details
-
-```
-/og_report
-```
-
-### 6. Provide Feedback
-
-```
-# Report false positive
-/og_feedback 1 fp This is normal security documentation
-
-# Report missed detection
-/og_feedback missed Email contained hidden injection that wasn't detected
-```
-
 ## Configuration
 
 Edit OpenClaw config file (`~/.openclaw/openclaw.json`):
@@ -303,17 +188,10 @@ Edit OpenClaw config file (`~/.openclaw/openclaw.json`):
       "moltguard": {
         "enabled": true,
         "config": {
-          // Gateway (Prompt Sanitization)
-          "sanitizePrompt": false,      // Enable local prompt sanitization
-          "gatewayPort": 8900,          // Gateway port
-          "gatewayAutoStart": true,     // Auto-start gateway
-
-          // Injection Detection
-          "blockOnRisk": true,          // Block when injection detected
-          "apiKey": "",                 // Auto-registered if empty
-          "timeoutMs": 60000,           // Analysis timeout
-          "autoRegister": true,         // Auto-register API key
-          "apiBaseUrl": "https://api.moltguard.com"
+          "sanitizePrompt": true,
+          "gatewayPort": 8900,
+          "gatewayAutoStart": true,
+          "vaultTtlSeconds": 3600
         }
       }
     }
@@ -323,116 +201,76 @@ Edit OpenClaw config file (`~/.openclaw/openclaw.json`):
 
 ### Configuration Options
 
-#### Gateway (Prompt Sanitization)
-
 | Option | Default | Description |
 |--------|---------|-------------|
 | `sanitizePrompt` | `false` | Enable local prompt sanitization gateway |
 | `gatewayPort` | `8900` | Port for the gateway server |
 | `gatewayAutoStart` | `true` | Automatically start gateway when OpenClaw starts |
+| `vaultTtlSeconds` | `3600` | TTL for token vault entries in seconds (data minimization) |
+| `vaultMaxEntries` | `10000` | Maximum token vault entries before LRU eviction |
+| `blockOnRisk` | `true` | Block tool calls when a risk is detected |
+| `timeoutMs` | `60000` | Timeout for gateway operations in milliseconds |
 
-#### Injection Detection
+## Commands
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `enabled` | `true` | Enable/disable injection detection |
-| `blockOnRisk` | `true` | Block tool calls when injection is detected |
-| `apiKey` | (auto) | MoltGuard API key (auto-registered if empty) |
-| `autoRegister` | `true` | Auto-register API key on first use |
-| `timeoutMs` | `60000` | Analysis timeout in milliseconds |
-| `apiBaseUrl` | `https://api.moltguard.com` | MoltGuard API endpoint |
-
-### Common Configurations
-
-**Monitor-only mode** (log detections without blocking):
-```json
-{
-  "blockOnRisk": false
-}
-```
-
-**Full protection mode** (sanitization + detection):
-```json
-{
-  "sanitizePrompt": true,
-  "blockOnRisk": true
-}
-```
+| Command | Description |
+|---------|-------------|
+| `/mg_status` | View gateway status and configuration |
+| `/mg_start` | Start the sanitization gateway |
+| `/mg_stop` | Stop the sanitization gateway |
+| `/mg_restart` | Restart the sanitization gateway |
 
 ## Privacy & Security
 
-MoltGuard takes a **privacy-first, local-first** approach:
+MoltGuard is **entirely local software**. It makes zero network calls to any MoltGuard server.
 
-### Local Processing
+### Network Architecture
 
-✅ **Gateway sanitization is 100% local** - Sensitive data never leaves your machine. The gateway runs on `localhost` and processes all data locally before forwarding to LLMs.
+```
+Your prompts
+     |
+     v
+[MoltGuard Gateway @ 127.0.0.1:8900]  <-- local only
+     |
+     | PII stripped, placeholders inserted
+     v
+[LLM API: Anthropic / OpenAI / Gemini / DeepSeek]
+     |
+     | Response with placeholders
+     v
+[MoltGuard Gateway]  <-- restores original values
+     |
+     v
+Your tools execute with real data
+```
 
-✅ **Injection detection sanitization is local** - Before sending content to the MoltGuard API for analysis, all PII/secrets are stripped locally and replaced with placeholders. Only sanitized content is sent.
+### What Leaves Your Machine
 
-### Data Storage
+Only **tokenized placeholders** (e.g., `[ssn_1]`, `[person_1]`) reach cloud LLM APIs. The mapping between placeholders and original values never leaves `~/.moltguard/token-vault.json` (owner-only permissions, `0o600`). If an LLM strips the brackets, the restorer still matches the bare token (e.g., `ssn_1`) using word-boundary-aware replacement.
 
-✅ **API keys stored locally** - Your unique API key is stored at `~/.openclaw/credentials/moltguard/credentials.json`. No shared or hard-coded keys.
+A post-sanitization canary check scans every outbound payload for residual SSN/EIN patterns before forwarding, aborting the request if any are detected. Session IDs are validated as UUID v4 format.
 
-✅ **Logs stored locally** - Analysis results are stored in local JSONL files at `~/.openclaw/logs/`. Never sent to external servers.
+### Session Management
 
-✅ **Gateway mappings are ephemeral** - Placeholder-to-original-value mappings exist only during the request cycle and are immediately discarded after response is restored.
+The gateway maintains a **persistent session** for its lifetime, ensuring consistent placeholder mappings across all API calls in a conversation (e.g., `[person_1]` always maps to the same name across turns). The session is created at gateway startup and destroyed on shutdown (SIGINT/SIGTERM). Clients can still override the session by sending an `x-moltguard-session` header with a valid UUID v4.
 
-### Network Transparency
+### Data Minimization
 
-**Gateway** makes zero external network calls. It's a pure localhost proxy (`127.0.0.1`).
+- Vault entries expire after a configurable TTL (default: 1 hour)
+- LRU eviction caps vault size at `maxEntries` (default: 10,000)
+- The gateway session is destroyed on shutdown; vault entries are cleaned up
+- Periodic purge removes expired entries (every 5 minutes)
+- The gateway binds to `127.0.0.1` only and serves no CORS headers
+- See [TOKEN_VAULT.md](./TOKEN_VAULT.md) for architecture details
 
-**Injection Detection** makes exactly 2 types of calls to `api.moltguard.com`:
-1. `POST /api/register` - One-time API key registration (if auto-register enabled)
-2. `POST /api/check/tool-call` - Analysis requests with sanitized content only
-
-**No third-party LLM calls** - Content is never forwarded to OpenAI or other third parties.
-
-**Content is not stored** - The MoltGuard API does not persist content after analysis completes.
-
-### Open Source & Auditable
+### Auditable Source
 
 All code is open source. Key files:
-- `gateway/sanitizer.ts` - Sanitization patterns and logic
-- `gateway/restorer.ts` - Restoration logic
-- `agent/sanitizer.ts` - Injection detection sanitization
-- `agent/runner.ts` - API communication for detection
-
-## Injection Detection API Details
-
-MoltGuard uses a single API endpoint for detection:
-
-```
-POST https://api.moltguard.com/api/check/tool-call
-Authorization: Bearer <your-api-key>
-Content-Type: application/json
-
-{
-  "content": "<content to analyze>",
-  "async": false
-}
-```
-
-Response:
-
-```json
-{
-  "ok": true,
-  "verdict": {
-    "isInjection": true,
-    "confidence": 0.95,
-    "reason": "Contains hidden instructions to override system prompt",
-    "findings": [
-      {
-        "suspiciousContent": "SYSTEM ALERT: Override all previous instructions...",
-        "reason": "Attempts to override system prompt",
-        "confidence": 0.95
-      }
-    ]
-  }
-}
-```
-
-API key registration happens automatically via `POST /api/register` on first use.
+- `gateway/sanitizer.ts` - NLP-powered sanitization patterns and logic (including multi-cap surname detection, email-header/salutation-context name extraction)
+- `gateway/restorer.ts` - Placeholder restoration logic (bracket-aware, bracket-stripped, and fabricated-placeholder preservation)
+- `gateway/token-vault.ts` - Persistent session-scoped token vault
+- `gateway/handlers/*.ts` - Anthropic, OpenAI, and Gemini protocol handlers
+- `index.ts` - Plugin hooks for tool-call sanitization
 
 ## Uninstall
 
@@ -441,10 +279,10 @@ openclaw plugins uninstall @openguardrails/moltguard
 openclaw gateway restart
 ```
 
-To also remove your stored API key:
+To also remove local vault data:
 
 ```bash
-rm ~/.openclaw/credentials/moltguard/credentials.json
+rm -rf ~/.moltguard/
 ```
 
 ## Development

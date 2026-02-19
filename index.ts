@@ -1,16 +1,20 @@
 /**
- * MoltGuard - API-based Prompt Injection Detection Plugin
+ * MoltGuard - Local PII Sanitization Gateway Plugin
  *
- * Detects prompt injection attacks hidden in long content by
- * sending it to the MoltGuard API for analysis.
+ * Sanitizes PII in tool calls and API requests before they leave
+ * the local machine. All processing is local — no data is sent
+ * to any MoltGuard cloud endpoint.
  */
 
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
-import type { OpenClawGuardConfig, AnalysisTarget, Logger } from "./agent/types.js";
-import { resolveConfig, loadApiKey, registerApiKey } from "./agent/config.js";
-import { runGuardAgent } from "./agent/runner.js";
-import { createAnalysisStore } from "./memory/store.js";
+import type { OpenClawGuardConfig, Logger } from "./agent/config.js";
+import { resolveConfig } from "./agent/config.js";
 import { GatewayManager } from "./gateway-manager.js";
+import { sanitize } from "./gateway/sanitizer.js";
+import type { SanitizationState } from "./gateway/sanitizer.js";
+import type { MappingTable } from "./gateway/types.js";
+import { restore } from "./gateway/restorer.js";
+import { TokenVault } from "./gateway/token-vault.js";
 
 // =============================================================================
 // Constants
@@ -21,63 +25,85 @@ const PLUGIN_NAME = "MoltGuard";
 const LOG_PREFIX = `[${PLUGIN_ID}]`;
 
 // =============================================================================
-// Helper Functions
+// Tool-Call Sanitization Helpers
 // =============================================================================
 
+/** External-facing CLI commands that send data off-machine */
+const EXTERNAL_CMDS = ["curl", "gog", "wget", "http", "httpie", "ssh", "scp", "sftp", "rsync"];
+const EXTERNAL_CMD_RE = new RegExp(`\\b(${EXTERNAL_CMDS.join("|")})\\b`);
+
 /**
- * Extract text content from a tool result message
+ * Detect whether a Bash command sends data to an external service.
+ * Checks for external CLI tools anywhere in the command string — covers:
+ * - Direct invocation: `curl ...`
+ * - Chained commands: `cd /tmp && gog gmail send ...`
+ * - Piped commands: `echo x | curl -d @- ...`
+ * - Subshells: `$(curl ...)` and backticks
+ * - Wrappers: `env X=y gog ...`, `bash -c "curl ..."`, `nohup curl ...`
  */
-function extractToolResultContent(message: unknown): string | null {
-  if (!message || typeof message !== "object") {
-    return null;
+function isExternalBashCommand(command: string): boolean {
+  return EXTERNAL_CMD_RE.test(command);
+}
+
+/**
+ * CLI flags whose values are local credential lookups, not outbound PII.
+ * These are used by tools like `gog` to select which OAuth token to use
+ * and must not be sanitized — doing so breaks authentication.
+ */
+const AUTH_FLAGS = ["--account", "--client"];
+
+/**
+ * Temporarily shield auth-related flag values from sanitization.
+ *
+ * Replaces `--account user@example.com` (and `--account=...`, quoted forms)
+ * with inert markers that the sanitizer will ignore, then returns a restore
+ * function to swap the originals back into the sanitized output.
+ */
+export function shieldAuthArgs(command: string): {
+  shielded: string;
+  restore: (s: string) => string;
+} {
+  const replacements: Array<{ marker: string; original: string }> = [];
+  let shielded = command;
+
+  for (const flag of AUTH_FLAGS) {
+    // Match --flag=value or --flag <space> value
+    // Value can be double-quoted, single-quoted, or bare (non-whitespace)
+    const escaped = flag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const pattern = new RegExp(
+      `(${escaped})(?:(=)("(?:[^"\\\\]|\\\\.)*"|'(?:[^'\\\\]|\\\\.)*'|\\S+)|(\\s+)("(?:[^"\\\\]|\\\\.)*"|'(?:[^'\\\\]|\\\\.)*'|\\S+))`,
+      "g",
+    );
+    shielded = shielded.replace(pattern, (_match, flagName, eq, eqVal, sp, spVal) => {
+      const value = eq ? eqVal : spVal;
+      const sep = eq ? eq : sp;
+      const marker = `__MOLTGUARD_AUTH_${replacements.length}__`;
+      replacements.push({ marker, original: value });
+      return `${flagName}${sep}${marker}`;
+    });
   }
 
-  const msg = message as Record<string, unknown>;
-
-  // Format 1: { content: string }
-  if (typeof msg.content === "string") {
-    return msg.content;
-  }
-
-  // Format 2: { content: [{ type: "text", text: string }] }
-  if (Array.isArray(msg.content)) {
-    const texts: string[] = [];
-    for (const part of msg.content) {
-      if (part && typeof part === "object") {
-        const p = part as Record<string, unknown>;
-        if (p.type === "text" && typeof p.text === "string") {
-          texts.push(p.text);
-        } else if (p.type === "tool_result" && typeof p.content === "string") {
-          texts.push(p.content);
-        }
+  return {
+    shielded,
+    restore: (s: string) => {
+      let result = s;
+      for (const { marker, original } of replacements) {
+        result = result.split(marker).join(original);
       }
-    }
-    if (texts.length > 0) {
-      return texts.join("\n");
-    }
-  }
+      return result;
+    },
+  };
+}
 
-  // Format 3: { text: string }
-  if (typeof msg.text === "string") {
-    return msg.text;
+/**
+ * Replace placeholders in a tool result message with original values.
+ * Handles the various message content formats (string, array of content blocks, etc.)
+ */
+function restoreMessageContent(message: unknown, mappingTable: MappingTable): unknown {
+  if (!message || typeof message !== "object" || mappingTable.size === 0) {
+    return message;
   }
-
-  // Format 4: { result: string }
-  if (typeof msg.result === "string") {
-    return msg.result;
-  }
-
-  // Try to stringify if it's an object
-  try {
-    const str = JSON.stringify(msg);
-    if (str.length > 100) {
-      return str;
-    }
-  } catch {
-    // ignore
-  }
-
-  return null;
+  return restore(message, mappingTable);
 }
 
 // =============================================================================
@@ -97,334 +123,154 @@ function createLogger(baseLogger: Logger): Logger {
 // Plugin Definition
 // =============================================================================
 
-// Store gateway manager instance for cleanup (closure variable)
+// Store gateway manager and vault instances for cleanup (closure variables)
 let globalGatewayManager: GatewayManager | null = null;
+let globalVault: TokenVault | null = null;
 
 const openClawGuardPlugin = {
   id: PLUGIN_ID,
   name: PLUGIN_NAME,
   description:
-    "API-based prompt injection detection powered by MoltGuard",
+    "Local PII sanitization gateway powered by MoltGuard",
 
   register(api: OpenClawPluginApi) {
     const pluginConfig = (api.pluginConfig ?? {}) as OpenClawGuardConfig;
     const config = resolveConfig(pluginConfig);
     const log = createLogger(api.logger);
 
-    // Check if at least one feature is enabled
-    if (!config.enabled && !config.sanitizePrompt) {
-      log.info("Plugin disabled via config (both injection detection and gateway disabled)");
+    if (!config.sanitizePrompt) {
+      log.info("Plugin disabled via config (sanitizePrompt is false)");
       return;
     }
 
-    // Initialize analysis store (needed for both features)
-    const logPath = api.resolvePath(config.logPath);
-    const store = createAnalysisStore(logPath, log);
+    // Initialize gateway
+    globalGatewayManager = new GatewayManager(
+      {
+        port: config.gatewayPort || 8900,
+        autoStart: config.gatewayAutoStart ?? true,
+      },
+      log,
+    );
 
-    // Initialize gateway if sanitizePrompt is enabled
-    if (config.sanitizePrompt) {
-      globalGatewayManager = new GatewayManager(
-        {
-          port: config.gatewayPort || 8900,
-          autoStart: config.gatewayAutoStart ?? true,
-        },
-        log,
-      );
+    // Start gateway
+    globalGatewayManager.start().catch((error) => {
+      log.error(`Failed to start gateway: ${error}`);
+    });
 
-      // Start gateway
-      globalGatewayManager.start().catch((error) => {
-        log.error(`Failed to start gateway: ${error}`);
-      });
+    log.info(`Gateway enabled on port ${config.gatewayPort || 8900}`);
+    log.info(
+      `Configure your model to use: http://127.0.0.1:${config.gatewayPort || 8900}`
+    );
 
-      log.info(`Gateway enabled on port ${config.gatewayPort || 8900}`);
-      log.info(
-        `Configure your model to use: http://127.0.0.1:${config.gatewayPort || 8900}`
-      );
+    // =========================================================================
+    // Tool-Call PII Sanitization (before_tool_call + result restoration)
+    // ALWAYS active — independent of gateway proxy.
+    // Even without the gateway proxy, tool calls must be sanitized because
+    // they send data to external services (Gmail, Notion, web search, etc.)
+    // =========================================================================
+
+    // Vault-backed sanitization state: accumulates mappings across tool calls
+    // so the same PII value always gets the same placeholder within a session.
+    // Session is created lazily on the first tool call that requires sanitization.
+    globalVault = new TokenVault({ ttlSeconds: config.vaultTtlSeconds });
+    let currentSessionId: string | null = null;
+    let sanitizationState: SanitizationState | null = null;
+    let toolCallSanitizationCount = 0;
+
+    function ensureSession(): SanitizationState {
+      if (!sanitizationState) {
+        currentSessionId = globalVault!.createSession();
+        sanitizationState = globalVault!.getSessionState(currentSessionId);
+        log.info(`Vault session created: ${currentSessionId}`);
+      }
+      return sanitizationState;
     }
 
-    // Resolve API key (from config, credentials file, or auto-register)
-    let resolvedApiKey = config.apiKey;
-    if (!resolvedApiKey) {
-      const savedKey = loadApiKey();
-      if (savedKey) {
-        resolvedApiKey = savedKey;
-        log.info("Loaded API key from credentials file");
-      } else if (config.autoRegister) {
-        log.info("No API key found — will auto-register on first analysis");
-      } else {
-        log.warn("No API key configured and autoRegister is disabled. Analyses will fail until apiKey is set.");
-      }
-    }
+    // --- before_tool_call: sanitize outbound params ---
+    api.on("before_tool_call", (event, ctx) => {
+      const { toolName, params } = event;
 
-    // Only register injection detection hooks if enabled
-    if (config.enabled) {
-      log.info("Injection detection enabled");
+      // Determine if this tool call is external-facing
+      let shouldSanitize = false;
+      let isBashCommand = false;
 
-      // Register tool_result_persist hook to analyze tool results
-      api.on("tool_result_persist", (event, ctx) => {
-      const toolName = ctx.toolName ?? event.toolName ?? "unknown";
-
-      log.info(`tool_result_persist triggered for "${toolName}"`);
-      log.debug?.(`Event message: ${JSON.stringify(event.message).slice(0, 500)}`);
-
-      // Extract content from tool result message
-      const content = extractToolResultContent(event.message);
-      if (!content || content.length < 100) {
-        log.debug?.(`Skipping short content (${content?.length ?? 0} chars)`);
-        return;
-      }
-
-      log.info(`Analyzing tool result from "${toolName}" (${content.length} chars)`);
-      const startTime = Date.now();
-
-      const target: AnalysisTarget = {
-        type: "tool_result",
-        content,
-        toolName,
-        metadata: {
-          sessionKey: ctx.sessionKey,
-          agentId: ctx.agentId,
-          toolCallId: ctx.toolCallId,
-        },
-      };
-
-      runGuardAgent(
-        target,
-        {
-          apiKey: resolvedApiKey,
-          timeoutMs: config.timeoutMs,
-          autoRegister: config.autoRegister,
-          apiBaseUrl: config.apiBaseUrl,
-        },
-        log,
-      ).then((verdict) => {
-        const durationMs = Date.now() - startTime;
-        const detected = verdict.isInjection && verdict.confidence >= 0.7;
-
-        store.logAnalysis({
-          targetType: "tool_result",
-          contentLength: content.length,
-          chunksAnalyzed: verdict.chunksAnalyzed,
-          verdict,
-          durationMs,
-          blocked: detected && config.blockOnRisk,
-        });
-
-        if (detected) {
-          log.warn(`INJECTION DETECTED in tool result from "${toolName}": ${verdict.reason}`);
+      if (toolName === "Bash" || toolName === "bash") {
+        const command = params.command as string | undefined;
+        if (command && isExternalBashCommand(command)) {
+          shouldSanitize = true;
+          isBashCommand = true;
         }
-      }).catch((error) => {
-        log.error(`Tool result analysis failed: ${error}`);
-      });
+      } else if (toolName === "WebSearch" || toolName === "web_search") {
+        shouldSanitize = true;
+      } else if (toolName === "WebFetch" || toolName === "web_fetch") {
+        shouldSanitize = true;
+      }
+
+      if (!shouldSanitize) return;
+
+      // Shield auth-related flag values (--account, --client) from
+      // sanitization. These are local credential lookups, not outbound PII.
+      let restoreAuth: ((s: string) => string) | null = null;
+      const paramsToSanitize = { ...params };
+      if (isBashCommand && typeof paramsToSanitize.command === "string") {
+        const { shielded, restore: restoreFn } = shieldAuthArgs(paramsToSanitize.command);
+        paramsToSanitize.command = shielded;
+        restoreAuth = restoreFn;
+      }
+
+      const state = ensureSession();
+      const { sanitized: sanitizedParams, redactionCount, redactionsByCategory } =
+        sanitize(paramsToSanitize, state);
+
+      // Restore shielded auth arguments in the sanitized command
+      if (restoreAuth && typeof sanitizedParams.command === "string") {
+        sanitizedParams.command = restoreAuth(sanitizedParams.command);
+      }
+
+      if (redactionCount > 0) {
+        toolCallSanitizationCount++;
+        const cats = Object.entries(redactionsByCategory)
+          .map(([k, v]) => `${k}=${v}`)
+          .join(", ");
+        log.warn(
+          `Tool call sanitized: ${toolName} — ${redactionCount} redactions (${cats})`,
+        );
+        return { params: sanitizedParams };
+      }
 
       return;
     });
 
-    // Register message_received hook (for analyzing long content)
-    api.on("message_received", (event, ctx) => {
-      log.info(`message_received hook triggered, content length: ${event.content.length}`);
+    // --- tool_result_persist: restore placeholders in results ---
+    api.on("tool_result_persist", (event, _ctx) => {
+      if (!sanitizationState || sanitizationState.mappingTable.size === 0) return;
 
-      if (event.content.length < 1000) {
-        log.info(`Skipping analysis: content too short (${event.content.length} < 1000 chars)`);
-        return;
+      const restored = restoreMessageContent(event.message, sanitizationState.mappingTable);
+      if (restored !== event.message) {
+        return { message: restored as typeof event.message };
       }
+      return;
+    }, { priority: 10 });
 
-      // Skip analysis if no API key and auto-register is disabled
-      // (Don't block user messages while waiting for API key registration)
-      if (!resolvedApiKey && !config.autoRegister) {
-        log.info("Skipping message analysis: no API key and autoRegister disabled");
-        return;
+    // --- session_end: log sanitization summary and destroy vault session ---
+    api.on("session_end", (_event, _ctx) => {
+      if (toolCallSanitizationCount > 0) {
+        log.info(
+          `Session summary: ${toolCallSanitizationCount} tool calls sanitized, ` +
+          `${sanitizationState?.mappingTable.size ?? 0} unique PII items tracked`,
+        );
       }
-
-      log.info("Starting async analysis...");
-
-      // Run analysis asynchronously (don't block message processing)
-      const startTime = Date.now();
-
-      const target: AnalysisTarget = {
-        type: "message",
-        content: event.content,
-        metadata: {
-          channelId: ctx.channelId,
-          from: event.from,
-        },
-      };
-
-      // Fire-and-forget: don't await (don't block the hook)
-      runGuardAgent(
-        target,
-        {
-          apiKey: resolvedApiKey,
-          timeoutMs: config.timeoutMs,
-          autoRegister: config.autoRegister,
-          apiBaseUrl: config.apiBaseUrl,
-        },
-        log,
-      ).then((verdict) => {
-        const durationMs = Date.now() - startTime;
-
-        store.logAnalysis({
-          targetType: "message",
-          contentLength: event.content.length,
-          chunksAnalyzed: verdict.chunksAnalyzed,
-          verdict,
-          durationMs,
-          blocked: false,
-        });
-
-        if (verdict.isInjection) {
-          log.warn(
-            `Suspicious content in message (${event.content.length} chars): ${verdict.reason}`,
-          );
-        }
-      }).catch((error) => {
-        log.error(`Message analysis failed: ${error}`);
-      });
-
-      // Return immediately (don't block message processing)
-      return undefined;
+      if (currentSessionId && globalVault) {
+        const destroyed = globalVault.destroySession(currentSessionId);
+        log.info(`Vault session destroyed: ${currentSessionId} (${destroyed} entries purged)`);
+        currentSessionId = null;
+        sanitizationState = null;
+      }
     });
 
-    // Register status command
-    api.registerCommand({
-      name: "og_status",
-      description: "Show MoltGuard status and statistics",
-      requireAuth: true,
-      handler: async () => {
-        const stats = store.getStats();
-        const feedbackStats = store.getFeedbackStats();
-        const recentLogs = store.getRecentLogs(5);
+    log.info("Tool-call PII sanitization enabled (before_tool_call hook active)");
 
-        const statusLines = [
-          "**MoltGuard Status**",
-          "",
-          `- Enabled: ${config.enabled}`,
-          `- Block on risk: ${config.blockOnRisk}`,
-          `- API key: ${resolvedApiKey ? "configured" : config.autoRegister ? "not set (will auto-register)" : "not set (autoRegister disabled)"}`,
-          `- Auto-register: ${config.autoRegister}`,
-          `- API base URL: ${config.apiBaseUrl}`,
-          "",
-          "**Statistics**",
-          `- Total analyses: ${stats.totalAnalyses}`,
-          `- Total blocked: ${stats.totalBlocked}`,
-          `- Blocked (24h): ${stats.blockedLast24h}`,
-          `- Avg duration: ${stats.avgDurationMs}ms`,
-          "",
-          "**User Feedback**",
-          `- False positives reported: ${feedbackStats.falsePositives}`,
-          `- Missed detections reported: ${feedbackStats.missedDetections}`,
-        ];
-
-        if (recentLogs.length > 0) {
-          statusLines.push("", "**Recent Analyses**");
-          for (const log of recentLogs) {
-            const status = log.blocked ? "BLOCKED" : log.verdict.isInjection ? "DETECTED" : "SAFE";
-            statusLines.push(
-              `- ${log.timestamp}: ${log.targetType} (${log.contentLength} chars) - ${status}`,
-            );
-          }
-        }
-
-        return { text: statusLines.join("\n") };
-      },
-    });
-
-    // Register report command
-    api.registerCommand({
-      name: "og_report",
-      description: "Show recent prompt injection detections",
-      requireAuth: true,
-      handler: async () => {
-        const detections = store.getRecentDetections(10);
-
-        if (detections.length === 0) {
-          return { text: "No prompt injection detections found." };
-        }
-
-        const lines = [
-          "**Recent Prompt Injection Detections**",
-          "",
-        ];
-
-        for (const d of detections) {
-          const status = d.blocked ? "BLOCKED" : "DETECTED";
-          lines.push(`**#${d.id}** - ${d.timestamp}`);
-          lines.push(`- Status: ${status}`);
-          lines.push(`- Type: ${d.targetType} (${d.contentLength} chars)`);
-          lines.push(`- Reason: ${d.verdict.reason}`);
-          if (d.verdict.findings.length > 0) {
-            const finding = d.verdict.findings[0];
-            lines.push(`- Suspicious: "${finding?.suspiciousContent?.slice(0, 100)}..."`);
-          }
-          lines.push("");
-        }
-
-        lines.push("Use `/og_feedback <id> fp` to report false positive");
-        lines.push("Use `/og_feedback missed <reason>` to report missed detection");
-
-        return { text: lines.join("\n") };
-      },
-    });
-
-    // Register feedback command
-    api.registerCommand({
-      name: "og_feedback",
-      description: "Report false positive or missed detection. Usage: /og_feedback <id> fp [reason] OR /og_feedback missed <reason>",
-      requireAuth: true,
-      acceptsArgs: true,
-      handler: async (ctx) => {
-        const parts = (ctx.args ?? "").trim().split(/\s+/);
-
-        if (parts.length === 0 || parts[0] === "") {
-          return {
-            text: [
-              "**Usage:**",
-              "- `/og_feedback <id> fp [reason]` - Report detection #id as false positive",
-              "- `/og_feedback missed <reason>` - Report a missed detection",
-              "",
-              "Use `/og_report` to see recent detections and their IDs.",
-            ].join("\n"),
-          };
-        }
-
-        if (parts[0] === "missed") {
-          const reason = parts.slice(1).join(" ") || "No reason provided";
-          store.logFeedback({
-            feedbackType: "missed_detection",
-            reason,
-          });
-          log.info(`User reported missed detection: ${reason}`);
-          return { text: `Thank you! Recorded missed detection report: "${reason}"` };
-        }
-
-        const analysisId = parseInt(parts[0]!, 10);
-        if (isNaN(analysisId)) {
-          return { text: "Invalid analysis ID. Use `/og_report` to see recent detections." };
-        }
-
-        if (parts[1] !== "fp") {
-          return { text: "Invalid command. Use `/og_feedback <id> fp [reason]`" };
-        }
-
-        const reason = parts.slice(2).join(" ") || "No reason provided";
-        store.logFeedback({
-          analysisId,
-          feedbackType: "false_positive",
-          reason,
-        });
-        log.info(`User reported false positive for analysis #${analysisId}: ${reason}`);
-        return { text: `Thank you! Recorded false positive report for detection #${analysisId}` };
-      },
-    });
-
-      log.info(
-        `Injection detection initialized (block: ${config.blockOnRisk}, timeout: ${config.timeoutMs}ms)`,
-      );
-    } else {
-      log.info("Injection detection disabled via config");
-    }
-
-    // Register gateway management commands (if gateway is enabled)
+    // Register gateway management commands
     if (globalGatewayManager) {
       api.registerCommand({
         name: "mg_status",
@@ -510,8 +356,16 @@ const openClawGuardPlugin = {
     }
   },
 
-  // Cleanup: stop gateway when plugin unloads
+  // Cleanup: stop gateway and close vault when plugin unloads
   async unregister() {
+    if (globalVault) {
+      try {
+        globalVault.close();
+      } catch (error) {
+        console.error("[moltguard] Failed to close vault during cleanup:", error);
+      }
+      globalVault = null;
+    }
     if (globalGatewayManager) {
       try {
         await globalGatewayManager.stop();

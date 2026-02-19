@@ -8,7 +8,9 @@
     "moltguard-gateway": "./gateway/index.ts"
   },
   "openclaw": {
-    "extensions": ["./index.ts"]
+    "extensions": [
+      "./index.ts"
+    ]
   },
   "scripts": {
     "build": "tsc",
@@ -56,5 +58,9 @@
   },
   "peerDependencies": {
     "openclaw": "*"
+  },
+  "dependencies": {
+    "wink-eng-lite-web-model": "^1.8.1",
+    "wink-nlp": "^2.4.0"
   }
 }

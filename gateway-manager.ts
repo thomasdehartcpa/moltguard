@@ -8,7 +8,7 @@ import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { Logger } from "./agent/types.js";
+import type { Logger } from "./agent/config.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 

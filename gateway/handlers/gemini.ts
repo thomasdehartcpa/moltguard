@@ -5,9 +5,10 @@
  */
 
 import type { IncomingMessage, ServerResponse } from "node:http";
-import type { GatewayConfig, MappingTable } from "../types.js";
-import { sanitize } from "../sanitizer.js";
+import { type GatewayConfig, isValidUuidV4 } from "../types.js";
+import { sanitize, assertNoLeakedPii } from "../sanitizer.js";
 import { restore } from "../restorer.js";
+import type { TokenVault } from "../token-vault.js";
 
 /**
  * Handle Gemini API request
@@ -17,26 +18,29 @@ export async function handleGeminiRequest(
   res: ServerResponse,
   config: GatewayConfig,
   modelName: string,
+  vault: TokenVault,
+  gatewaySessionId: string,
 ): Promise<void> {
+  // Resolve session: use client-provided header (if valid UUID v4) or fall
+  // back to the shared gateway session for cross-request consistency.
+  const rawSession = req.headers["x-moltguard-session"] as string | undefined;
+  const headerSession = rawSession && isValidUuidV4(rawSession) ? rawSession : undefined;
+  const sessionId = headerSession ?? gatewaySessionId;
+
   try {
     // 1. Parse request body
     const body = await readBody(req);
     const requestData = JSON.parse(body);
 
-    const { contents, tools, generationConfig, ...rest } = requestData;
+    // 2. Sanitize the entire request body (contents, tools, metadata, etc.)
+    const { mappingTable, categoryCounters } = vault.getSessionState(sessionId);
+    const { sanitized: sanitizedRequest } = sanitize(requestData, { mappingTable, categoryCounters });
 
-    // 2. Sanitize contents (Gemini uses "contents" instead of "messages")
-    const { sanitized: sanitizedContents, mappingTable } = sanitize(contents);
+    // 4. Post-sanitization canary check (defense-in-depth)
+    const serializedPayload = JSON.stringify(sanitizedRequest);
+    assertNoLeakedPii(serializedPayload);
 
-    // 3. Build sanitized request
-    const sanitizedRequest = {
-      contents: sanitizedContents,
-      ...(tools && { tools }),
-      ...(generationConfig && { generationConfig }),
-      ...rest,
-    };
-
-    // 4. Get backend config
+    // 5. Get backend config
     const backend = config.backends.gemini;
     if (!backend) {
       res.writeHead(500, { "Content-Type": "application/json" });
@@ -44,7 +48,7 @@ export async function handleGeminiRequest(
       return;
     }
 
-    // 5. Forward to Gemini API
+    // 6. Forward to Gemini API
     const apiUrl = `${backend.baseUrl}/v1/models/${modelName}:generateContent`;
     const response = await fetch(apiUrl, {
       method: "POST",
@@ -52,7 +56,7 @@ export async function handleGeminiRequest(
         "Content-Type": "application/json",
         "x-goog-api-key": backend.apiKey,
       },
-      body: JSON.stringify(sanitizedRequest),
+      body: serializedPayload,
     });
 
     if (!response.ok) {

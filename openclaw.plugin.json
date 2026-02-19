@@ -46,6 +46,10 @@
       "apiBaseUrl": {
         "type": "string",
         "description": "MoltGuard API base URL (default: https://api.moltguard.com)"
+      },
+      "vaultTtlSeconds": {
+        "type": "number",
+        "description": "TTL in seconds for token vault entries. Controls how long PII-to-placeholder mappings persist for cross-turn consistency. (default: 3600)"
       }
     }
   },
@@ -95,6 +99,11 @@
     "apiBaseUrl": {
       "label": "API Base URL",
       "help": "Override the MoltGuard API endpoint (e.g. staging or self-hosted).",
+      "advanced": true
+    },
+    "vaultTtlSeconds": {
+      "label": "Vault TTL (seconds)",
+      "help": "How long token vault entries persist for cross-turn placeholder consistency. Lower values enforce stricter data minimization.",
       "advanced": true
     }
   }
